@@ -21,3 +21,5 @@ data/
 
 # system
 .DS_Store
+.data/
+.data/
