@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# environments
+env/
+venv/
+.conda/
+
+# training outputs
+outputs/predictions
+data/
+.data/
+*.pt
+*.pth
+*.ckpt
+
+# logs
+*.log
+
+# system
+.DS_Store
