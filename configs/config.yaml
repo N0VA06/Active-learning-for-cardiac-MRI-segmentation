@@ -1,9 +1,3 @@
-
-# ============================================================
-#  Active Learning for ACDC Cardiac MRI Segmentation
-#  Configuration File  –  v2 (improved architecture + training)
-# ============================================================
-
 paths:
   raw_data:         "data/raw/acdc"
   processed_images: "data/processed/images"
