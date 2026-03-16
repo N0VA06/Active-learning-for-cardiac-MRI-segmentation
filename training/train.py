@@ -1,19 +1,3 @@
-"""
-training/train.py
-==================
-Single-round training with optional early-exit auxiliary losses.
-
-When the model is an ``EarlyExitWrapper`` (detected by ``set_exit_mode``),
-training uses auxiliary exits:
-
-    L_total = L_final  +  λ · (L_exit1 + L_exit2 + ...)
-
-where λ = cfg["early_exit"]["aux_loss_weight"] (default 0.3).
-
-Early-exit mode is enabled only during the *training* phase; validation
-always uses final-exit logits only (exit_mode=False) for a clean metric.
-"""
-
 from __future__ import annotations
 
 import time
