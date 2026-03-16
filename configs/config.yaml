@@ -83,7 +83,11 @@ active_learning:
   query_size:       8
   num_cycles:       8
   mc_samples:       20
+<<<<<<< HEAD
   uncertainty:      "add"                   
+=======
+  uncertainty:      "mul"                   
+>>>>>>> 1d18016 (multiplicative architecture)
 
 evaluation:
   include_background:    false
