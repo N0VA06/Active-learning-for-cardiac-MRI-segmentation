@@ -99,12 +99,20 @@ def step_al(cfg: dict, device: torch.device) -> dict:
 
 def step_final_inference(cfg: dict, device: torch.device) -> None:
     banner("Step 4 – Final Inference & Visualisation")
-    from models.unet_model import build_model
+
+    # ── Build model (early-exit aware) ────────────────────────────────────
+    ee_cfg = cfg.get("early_exit", {})
+    if ee_cfg.get("enabled", False):
+        from models.early_exit_unet import build_early_exit_model
+        model = build_early_exit_model(cfg, device)
+    else:
+        from models.unet_model import build_model
+        model = build_model(cfg, device)
+
     from evaluation.inference import load_best_checkpoint, run_inference
     from preprocessing.dataset_utils import PoolManager, make_inference_loader
     from visualization.plots import save_metrics_table_plot
 
-    model = build_model(cfg, device)
     try:
         model = load_best_checkpoint(
             model=model, models_dir=cfg["paths"]["output_models"], device=device,
@@ -112,6 +120,10 @@ def step_final_inference(cfg: dict, device: torch.device) -> None:
     except FileNotFoundError as e:
         print(f"  [SKIP] {e}")
         return
+
+    # Ensure inference uses final exit only (no auxiliary outputs)
+    if hasattr(model, "set_exit_mode"):
+        model.set_exit_mode(False)
 
     pool = PoolManager(cfg["paths"]["labeled_pool"], cfg["paths"]["unlabeled_pool"])
     loader = make_inference_loader(

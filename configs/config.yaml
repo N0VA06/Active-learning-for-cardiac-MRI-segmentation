@@ -1,7 +1,6 @@
-
 # ============================================================
 #  Active Learning for ACDC Cardiac MRI Segmentation
-#  Configuration File  –  v2 (improved architecture + training)
+#  Configuration File  –  v3 (early-exit uncertainty)
 # ============================================================
 
 paths:
@@ -22,40 +21,61 @@ preprocessing:
   norm_method:      "zscore"
 
 # ── Model  ────────────────────────────────────────────────────
-# AttentionUNet with wider channels + deeper residual units
 model:
-  architecture:     "attention_unet"       # attention_unet | unet
+  architecture:     "attention_unet"
   in_channels:      1
   out_channels:     4                      # BG=0, RV=1, MYO=2, LV=3
   channels:         [32, 64, 128, 256, 320]
   strides:          [2, 2, 2, 2]
-  num_res_units:    3                      # was 2
-  dropout_prob:     0.15                   # slightly lower for stable training
+  num_res_units:    3
+  dropout_prob:     0.15
 
 # ── Training  ─────────────────────────────────────────────────
 training:
-  epochs:           50                     # was 30
+  epochs:           50
   batch_size:       8
-  lr:               3.0e-4                 # higher start; cosine decays to lr_min
+  lr:               3.0e-4
   lr_min:           1.0e-6
-  warmup_epochs:    5                      # linear LR warmup
+  warmup_epochs:    5
   weight_decay:     1.0e-4
-  grad_clip:        1.0                    # gradient clipping max-norm
-  amp:              true                   # mixed precision (RTX 4060 supports bf16/fp16)
+  grad_clip:        1.0
+  amp:              true
   num_workers:      4
   val_fraction:     0.2
   seed:             42
 
 # ── Loss  ─────────────────────────────────────────────────────
-# Tversky-focal dice penalises FN harder (good for small structures)
 loss:
-  type:             "dice_focal"           # dice_focal | dice_ce
+  type:             "dice_focal"
   dice_weight:      0.6
   focal_weight:     0.4
-  focal_gamma:      2.0                    # focal exponent
-  tversky_alpha:    0.3                    # FP weight  (0.5=Dice, <0.5=penalise FP more)
-  tversky_beta:     0.7                    # FN weight  (>0.5=penalise FN more)
-  class_weights:    [0.1, 1.0, 1.0, 1.0]  # down-weight BG, equal for structures
+  focal_gamma:      2.0
+  tversky_alpha:    0.3
+  tversky_beta:     0.7
+  class_weights:    [0.1, 1.0, 1.0, 1.0]
+
+# ── Early Exit  ───────────────────────────────────────────────
+# Exit heads are attached to intermediate decoder ConvTranspose2d layers.
+#
+# exit_indices (sorted deepest → shallowest):
+#   0 = deepest decoder  (ct out_ch=256, ~20×20)
+#   1 = middle-deep      (ct out_ch=128, ~40×40)  ← hooked
+#   2 = middle-shallow   (ct out_ch=64,  ~80×80)  ← hooked
+#   3 = shallowest       (ct out_ch=32,  ~160×160)
+#
+# aux_loss_weight: λ for auxiliary exit losses during training
+#   L_total = L_final + λ*(L_exit1 + L_exit2)
+#   0.3 is a good default; lower (0.1) if exit heads hurt main Dice
+#
+# alpha / beta: weights for the combined uncertainty score
+#   U_combined = α·U_mc_dropout + β·U_exit_disagreement
+#   Sum need not equal 1; both are min-max normalised first
+early_exit:
+  enabled:          true
+  exit_indices:     [1, 2]
+  aux_loss_weight:  0.3
+  alpha:            0.5                    # MC-Dropout weight
+  beta:             0.5                    # exit-disagreement weight
 
 # ── Active Learning  ──────────────────────────────────────────
 active_learning:
@@ -63,9 +83,8 @@ active_learning:
   query_size:       8
   num_cycles:       8
   mc_samples:       20
-  uncertainty:      "entropy"
+  uncertainty:      "add"                   
 
-# ── Evaluation  ───────────────────────────────────────────────
 evaluation:
   include_background:    false
   hausdorff_percentile:  95

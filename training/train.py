@@ -1,3 +1,19 @@
+"""
+training/train.py
+==================
+Single-round training with optional early-exit auxiliary losses.
+
+When the model is an ``EarlyExitWrapper`` (detected by ``set_exit_mode``),
+training uses auxiliary exits:
+
+    L_total = L_final  +  λ · (L_exit1 + L_exit2 + ...)
+
+where λ = cfg["early_exit"]["aux_loss_weight"] (default 0.3).
+
+Early-exit mode is enabled only during the *training* phase; validation
+always uses final-exit logits only (exit_mode=False) for a clean metric.
+"""
+
 from __future__ import annotations
 
 import time
@@ -16,7 +32,7 @@ from training.loss import SegmentationLoss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pure-PyTorch one-hot
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _one_hot(indices: torch.Tensor, C: int) -> torch.Tensor:
@@ -28,7 +44,7 @@ def _one_hot(indices: torch.Tensor, C: int) -> torch.Tensor:
 
 
 def _batch_dice(logits: torch.Tensor, labels: torch.Tensor, C: int) -> float:
-    """Mean foreground Dice for one batch."""
+    """Mean foreground Dice for one batch (no gradient)."""
     pred_oh  = _one_hot(torch.argmax(logits, 1, keepdim=True), C)
     label_oh = _one_hot(labels.unsqueeze(1), C)
     dm = DiceMetric(include_background=False, reduction="mean")
@@ -38,14 +54,25 @@ def _batch_dice(logits: torch.Tensor, labels: torch.Tensor, C: int) -> float:
     return val
 
 
+def _has_early_exits(model: nn.Module) -> bool:
+    """True if model supports early-exit mode (EarlyExitWrapper)."""
+    return hasattr(model, "set_exit_mode") and hasattr(model, "exit_heads")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # LR schedule: linear warmup → cosine anneal
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_scheduler(optimizer, warmup_epochs: int, total_epochs: int, lr_min: float, base_lr: float):
+def _build_scheduler(
+    optimizer:    torch.optim.Optimizer,
+    warmup_epochs: int,
+    total_epochs:  int,
+    lr_min:        float,
+    base_lr:       float,
+) -> SequentialLR:
     warmup = LambdaLR(
         optimizer,
-        lr_lambda=lambda e: (e + 1) / max(warmup_epochs, 1)
+        lr_lambda=lambda e: (e + 1) / max(warmup_epochs, 1),
     )
     cosine = CosineAnnealingLR(
         optimizer,
@@ -54,8 +81,8 @@ def _build_scheduler(optimizer, warmup_epochs: int, total_epochs: int, lr_min: f
     )
     return SequentialLR(
         optimizer,
-        schedulers  = [warmup, cosine],
-        milestones  = [warmup_epochs],
+        schedulers = [warmup, cosine],
+        milestones = [warmup_epochs],
     )
 
 
@@ -73,23 +100,42 @@ def train_one_round(
     al_cycle:     int,
     save_dir:     str | Path,
 ) -> Tuple[float, Dict[str, List[float]]]:
+    """
+    Train for one AL cycle and return (best_val_dice, history).
 
-    save_dir = Path(save_dir)
+    Early-exit auxiliary losses
+    ---------------------------
+    If the model is an EarlyExitWrapper the training forward pass runs
+    in exit mode and accumulates auxiliary losses from each exit head:
+
+        L = L_final  +  aux_w · sum(L_exit_i)
+
+    Validation always uses final-exit logits (exit_mode=False).
+    """
+    save_dir  = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    t_cfg        = cfg["training"]
-    num_epochs   = t_cfg["epochs"]
-    base_lr      = float(t_cfg["lr"])
-    lr_min       = float(t_cfg.get("lr_min", 1e-6))
-    weight_decay = float(t_cfg.get("weight_decay", 1e-4))
-    grad_clip    = float(t_cfg.get("grad_clip", 1.0))
-    warmup_ep    = int(t_cfg.get("warmup_epochs", 5))
-    use_amp      = bool(t_cfg.get("amp", True)) and device.type == "cuda"
-    C            = cfg["model"]["out_channels"]
+    t_cfg       = cfg["training"]
+    ee_cfg      = cfg.get("early_exit", {})
+    num_epochs  = t_cfg["epochs"]
+    base_lr     = float(t_cfg["lr"])
+    lr_min      = float(t_cfg.get("lr_min", 1e-6))
+    weight_decay= float(t_cfg.get("weight_decay", 1e-4))
+    grad_clip   = float(t_cfg.get("grad_clip", 1.0))
+    warmup_ep   = int(t_cfg.get("warmup_epochs", 5))
+    use_amp     = bool(t_cfg.get("amp", True)) and device.type == "cuda"
+    C           = cfg["model"]["out_channels"]
+
+    use_exits   = _has_early_exits(model) and ee_cfg.get("enabled", False)
+    aux_w       = float(ee_cfg.get("aux_loss_weight", 0.3))
+
+    if use_exits:
+        print(f"  [Train] Early-exit auxiliary loss enabled  "
+              f"(λ={aux_w}, {len(model.exit_heads)} exit heads)")
 
     optimizer = AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay)
     scheduler = _build_scheduler(optimizer, warmup_ep, num_epochs, lr_min, base_lr)
-    scaler    = GradScaler('cuda', enabled=use_amp)
+    scaler    = GradScaler("cuda", enabled=use_amp)
 
     history: Dict[str, List[float]] = {
         "train_loss": [], "val_loss": [],
@@ -99,8 +145,12 @@ def train_one_round(
     best_ckpt_path = save_dir / f"cycle_{al_cycle:02d}_best.pth"
 
     for epoch in range(1, num_epochs + 1):
-        # ── Train ─────────────────────────────────────────────────────────────
+
+        # ── Train ─────────────────────────────────────────────────────────
         model.train()
+        if use_exits:
+            model.set_exit_mode(True)   # enable exit outputs
+
         t0 = time.time()
         tr_loss, tr_dice, nb = 0.0, 0.0, 0
 
@@ -109,9 +159,16 @@ def train_one_round(
             labels = batch["label"].to(device)   # (B,H,W)
 
             optimizer.zero_grad()
-            with autocast('cuda', enabled=use_amp):
-                logits = model(images)
-                loss   = loss_fn(logits, labels)
+
+            with autocast("cuda", enabled=use_amp):
+                if use_exits:
+                    logits, exit_logits_list = model(images)
+                    loss = loss_fn(logits, labels)
+                    for el in exit_logits_list:
+                        loss = loss + aux_w * loss_fn(el, labels)
+                else:
+                    logits = model(images)
+                    loss   = loss_fn(logits, labels)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -129,16 +186,19 @@ def train_one_round(
         avg_tr_dice = tr_dice / max(nb, 1)
         current_lr  = scheduler.get_last_lr()[0]
 
-        # ── Validate ─────────────────────────────────────────────────────────
+        # ── Validate (final exit only) ────────────────────────────────────
         model.eval()
+        if use_exits:
+            model.set_exit_mode(False)  # validation: final exit only
+
         vl_loss, vl_dice, nv = 0.0, 0.0, 0
 
         with torch.no_grad():
             for batch in val_loader:
                 images = batch["image"].to(device)
                 labels = batch["label"].to(device)
-                with autocast('cuda', enabled=use_amp):
-                    logits = model(images)
+                with autocast("cuda", enabled=use_amp):
+                    logits = model(images)          # returns final_logits
                 vl_loss += loss_fn(logits.float(), labels).item()
                 vl_dice += _batch_dice(logits.float(), labels, C)
                 nv += 1
@@ -160,13 +220,20 @@ def train_one_round(
 
         if avg_vl_dice > best_val_dice:
             best_val_dice = avg_vl_dice
-            torch.save({
-                "epoch":      epoch,
-                "state_dict": model.state_dict(),
-                "optimizer":  optimizer.state_dict(),
-                "val_dice":   best_val_dice,
-                "al_cycle":   al_cycle,
-            }, best_ckpt_path)
+            torch.save(
+                {
+                    "epoch":      epoch,
+                    "state_dict": model.state_dict(),   # includes exit heads
+                    "optimizer":  optimizer.state_dict(),
+                    "val_dice":   best_val_dice,
+                    "al_cycle":   al_cycle,
+                },
+                best_ckpt_path,
+            )
+
+    # Ensure exit mode is off after training
+    if use_exits:
+        model.set_exit_mode(False)
 
     print(f"  [Cycle {al_cycle}] Best val Dice: {best_val_dice:.4f} → {best_ckpt_path}")
 
